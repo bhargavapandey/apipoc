@@ -1,0 +1,187 @@
+name: Deploy ICSR Submit API
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/icsr-submit-e2b-v2/**'
+      - 'layers/**'
+      - 'infrastructure/**'
+      - 'pipelines/github-actions/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  LAMBDA_FUNCTION: icsr-submit-e2b-v2
+  AWS_REGION: us-east-1
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r src/${{ env.LAMBDA_FUNCTION }}/requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run unit tests
+        run: |
+          python -m pytest src/${{ env.LAMBDA_FUNCTION }}/tests/ -v --cov=src/${{ env.LAMBDA_FUNCTION }}
+
+      - name: Package Lambda function
+        id: package
+        run: |
+          mkdir -p build
+          cd src/${{ env.LAMBDA_FUNCTION }}
+          zip -r ../../build/${{ env.LAMBDA_FUNCTION }}.zip . -x '*/tests/*' '*.pyc'
+          cd ../..
+          echo "artifact-name=${{ env.LAMBDA_FUNCTION }}" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: build/
+          retention-days: 5
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: build/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform plan
+        run: |
+          cd infrastructure/environments/dev
+          terraform init
+          terraform plan -var="lambda_package_path=../../../build/${{ env.LAMBDA_FUNCTION }}.zip" -out=tfplan
+
+      - name: Terraform apply
+        run: |
+          cd infrastructure/environments/dev
+          terraform apply tfplan
+
+      - name: Run smoke tests
+        env:
+          API_ENDPOINT: ${{ steps.apply.outputs.api_endpoint }}
+        run: |
+          python -m pytest tests/integration/ -v -k dev
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: build/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform plan
+        run: |
+          cd infrastructure/environments/staging
+          terraform init
+          terraform plan -var="lambda_package_path=../../../build/${{ env.LAMBDA_FUNCTION }}.zip" -out=tfplan
+
+      - name: Terraform apply
+        run: |
+          cd infrastructure/environments/staging
+          terraform apply tfplan
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: build/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform plan
+        run: |
+          cd infrastructure/environments/prod
+          terraform init
+          terraform plan -var="lambda_package_path=../../../build/${{ env.LAMBDA_FUNCTION }}.zip" -out=tfplan
+
+      - name: Terraform apply
+        run: |
+          cd infrastructure/environments/prod
+          terraform apply tfplan
